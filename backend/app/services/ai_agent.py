@@ -1,0 +1,369 @@
+"""
+AI Agent service — the brain behind the chat-first CRM experience.
+Uses Groq (primary, blazing fast) with Gemini 2.5 Flash as fallback.
+"""
+import json
+import logging
+from uuid import UUID
+from datetime import datetime
+from groq import AsyncGroq
+import google.generativeai as genai
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+# Initialize AI clients
+groq_client = AsyncGroq(api_key=settings.GROQ_API_KEY) if settings.GROQ_API_KEY else None
+
+
+def init_gemini():
+    if settings.GEMINI_API_KEY:
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+        return genai.GenerativeModel("gemini-2.5-flash")
+    return None
+
+
+gemini_model = init_gemini()
+
+
+# ──────────────────────────────────────────────
+# System Prompt
+# ──────────────────────────────────────────────
+
+SYSTEM_PROMPT = """You are XENO AI, the intelligent marketing assistant for BeanBox Coffee — a premium coffee chain brand. You help marketers understand their customers, create targeted segments, craft personalized messages, and launch campaigns.
+
+## Your Capabilities (Tools)
+You have access to these tools to help the marketer:
+
+1. **query_customers** — Query customer data with filters. Returns matching customers and count.
+   Parameters: filters (list of {field, operator, value})
+   Available fields: total_spend, order_count, last_order_date, avg_order_value, tags, name, email
+   Available operators: >, <, >=, <=, ==, !=, days_ago_gt, days_ago_lt, contains, array_contains
+
+2. **create_segment** — Create a customer segment from rules.
+   Parameters: name (str), description (str), rules (list of {field, operator, value})
+
+3. **draft_message** — Draft a personalized marketing message.
+   Parameters: segment_description (str), channel (whatsapp/sms/email/rcs), tone (friendly/urgent/professional/playful), offer (str, optional)
+
+4. **create_campaign** — Create a campaign targeting a segment.
+   Parameters: name (str), segment_id (str), message_template (str), channel (str)
+
+5. **get_campaign_stats** — Get performance stats for a campaign.
+   Parameters: campaign_id (str)
+
+6. **get_insights** — Get general business insights and suggestions.
+   Parameters: none
+
+## Rules
+- Always be helpful, concise, and actionable.
+- When creating segments, explain what rules you're using and why.
+- When drafting messages, use {{name}} or {{first_name}} for personalization, and {{total_spend}}, {{order_count}} as available placeholders.
+- Before sending/creating anything, confirm with the marketer.
+- Provide data-driven recommendations when possible.
+- For channels: WhatsApp has highest engagement, Email is cheapest, SMS is direct, RCS is richest.
+- Always respond in a structured, easy-to-read format.
+"""
+
+TOOL_DEFINITIONS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "query_customers",
+            "description": "Query and filter customers from the database. Use this to answer questions about customer data.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filters": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "field": {"type": "string", "enum": ["total_spend", "order_count", "last_order_date", "avg_order_value", "name", "email"]},
+                                "operator": {"type": "string", "enum": [">", "<", ">=", "<=", "==", "!=", "days_ago_gt", "days_ago_lt", "contains"]},
+                                "value": {"type": ["string", "number"]}
+                            },
+                            "required": ["field", "operator", "value"]
+                        },
+                        "description": "List of filter rules to apply"
+                    }
+                },
+                "required": ["filters"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_segment",
+            "description": "Create a new customer segment with the given rules. Use this when the marketer wants to define an audience.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Name for the segment"},
+                    "description": {"type": "string", "description": "Description of the segment"},
+                    "rules": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "field": {"type": "string"},
+                                "operator": {"type": "string"},
+                                "value": {"type": ["string", "number"]}
+                            },
+                            "required": ["field", "operator", "value"]
+                        }
+                    }
+                },
+                "required": ["name", "description", "rules"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "draft_message",
+            "description": "Draft a personalized marketing message for a customer segment.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "segment_description": {"type": "string", "description": "Description of who the message is for"},
+                    "channel": {"type": "string", "enum": ["whatsapp", "sms", "email", "rcs"]},
+                    "tone": {"type": "string", "enum": ["friendly", "urgent", "professional", "playful"]},
+                    "offer": {"type": "string", "description": "Any specific offer or promotion to include"}
+                },
+                "required": ["segment_description", "channel", "tone"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_campaign",
+            "description": "Create a campaign to send messages to a segment. Use after a segment and message are ready.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Campaign name"},
+                    "segment_id": {"type": "string", "description": "UUID of the target segment"},
+                    "message_template": {"type": "string", "description": "The message template to send"},
+                    "channel": {"type": "string", "enum": ["whatsapp", "sms", "email", "rcs"]}
+                },
+                "required": ["name", "segment_id", "message_template", "channel"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_campaign_stats",
+            "description": "Get delivery and engagement statistics for a campaign.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "campaign_id": {"type": "string", "description": "UUID of the campaign"}
+                },
+                "required": ["campaign_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_insights",
+            "description": "Get business insights and AI-powered suggestions for the marketer.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            }
+        }
+    },
+]
+
+
+async def chat_with_ai(
+    message: str,
+    conversation_history: list[dict],
+    db_context: dict | None = None,
+) -> tuple[str, list[dict]]:
+    """
+    Send a message to the AI agent and get a response.
+    Returns (reply_text, tool_calls_made).
+
+    Uses Groq as primary (fast), falls back to Gemini.
+    """
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    # Add DB context if available
+    if db_context:
+        context_msg = f"\n\nCurrent database context:\n{json.dumps(db_context, indent=2, default=str)}"
+        messages[0]["content"] += context_msg
+
+    # Add conversation history
+    messages.extend(conversation_history)
+
+    # Add current message
+    messages.append({"role": "user", "content": message})
+
+    tool_calls_made = []
+
+    try:
+        # Try Groq first (blazing fast)
+        if groq_client:
+            response = await groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                tools=TOOL_DEFINITIONS,
+                tool_choice="auto",
+                temperature=0.7,
+                max_tokens=2048,
+            )
+
+            assistant_message = response.choices[0].message
+
+            # Check if AI wants to call tools
+            if assistant_message.tool_calls:
+                for tc in assistant_message.tool_calls:
+                    tool_calls_made.append({
+                        "name": tc.function.name,
+                        "arguments": json.loads(tc.function.arguments),
+                    })
+
+                return assistant_message.content or "", tool_calls_made
+
+            return assistant_message.content or "I'm not sure how to help with that.", tool_calls_made
+
+    except Exception as e:
+        logger.warning(f"Groq failed, falling back to Gemini: {e}")
+
+    # Fallback to Gemini
+    try:
+        if gemini_model:
+            # Convert messages to Gemini format
+            gemini_history = []
+            for msg in messages[1:]:  # Skip system (handled differently)
+                role = "user" if msg["role"] == "user" else "model"
+                gemini_history.append({"role": role, "parts": [msg["content"]]})
+
+            response = await gemini_model.generate_content_async(
+                gemini_history,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.7,
+                    max_output_tokens=2048,
+                ),
+            )
+            return response.text or "I'm not sure how to help with that.", tool_calls_made
+
+    except Exception as e:
+        logger.error(f"Both Groq and Gemini failed: {e}")
+
+    return "I'm experiencing some issues right now. Please try again in a moment.", tool_calls_made
+
+
+async def generate_message_draft(
+    segment_description: str,
+    channel: str,
+    tone: str,
+    offer: str | None = None,
+) -> str:
+    """Generate a marketing message draft using AI."""
+    prompt = f"""Draft a {tone} marketing message for {channel} channel.
+
+Target audience: {segment_description}
+{f'Special offer: {offer}' if offer else ''}
+
+Requirements:
+- Use {{{{name}}}} for personalization
+- Keep it concise (WhatsApp/SMS: 2-3 lines, Email: short paragraph, RCS: with call-to-action)
+- Be engaging and on-brand for a premium coffee chain
+- Include a clear call-to-action
+- Only return the message text, no explanations"""
+
+    try:
+        if groq_client:
+            response = await groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.8,
+                max_tokens=500,
+            )
+            return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.warning(f"Groq failed for message draft: {e}")
+
+    try:
+        if gemini_model:
+            response = await gemini_model.generate_content_async(prompt)
+            return response.text.strip()
+    except Exception as e:
+        logger.error(f"Both providers failed for message draft: {e}")
+
+    return f"Hey {{{{name}}}}! We have something special for you. Visit BeanBox today! 🎉"
+
+
+async def generate_segment_suggestions(customer_stats: dict) -> list[dict]:
+    """AI generates segment suggestions based on customer data patterns."""
+    prompt = f"""Based on these customer statistics for BeanBox Coffee:
+{json.dumps(customer_stats, indent=2)}
+
+Suggest 3-4 actionable customer segments that a marketer should target. For each, provide:
+1. A catchy segment name
+2. A brief description
+3. The filter rules as JSON: [{{"field": "...", "operator": "...", "value": ...}}]
+4. A suggested campaign action
+
+Available fields: total_spend, order_count, last_order_date, avg_order_value
+Available operators: >, <, >=, <=, days_ago_gt, days_ago_lt
+
+Return as a JSON array of objects with keys: name, description, rules, suggested_action
+Only return valid JSON, no markdown or explanation."""
+
+    try:
+        if groq_client:
+            response = await groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=1000,
+                response_format={"type": "json_object"},
+            )
+            content = response.choices[0].message.content
+            result = json.loads(content)
+            # Handle both {"suggestions": [...]} and [...] formats
+            if isinstance(result, dict):
+                return result.get("suggestions", result.get("segments", []))
+            return result
+    except Exception as e:
+        logger.warning(f"AI segment suggestions failed: {e}")
+
+    # Fallback: hardcoded suggestions
+    return [
+        {
+            "name": "High-Value Loyalists",
+            "description": "Customers who've spent over ₹5,000 with 5+ orders",
+            "rules": [
+                {"field": "total_spend", "operator": ">", "value": 5000},
+                {"field": "order_count", "operator": ">=", "value": 5}
+            ],
+            "suggested_action": "Send exclusive loyalty rewards"
+        },
+        {
+            "name": "At-Risk Churners",
+            "description": "Previously active customers who haven't ordered in 30+ days",
+            "rules": [
+                {"field": "order_count", "operator": ">=", "value": 2},
+                {"field": "last_order_date", "operator": "days_ago_gt", "value": 30}
+            ],
+            "suggested_action": "Win-back campaign with special offer"
+        },
+        {
+            "name": "New Customers",
+            "description": "Recently acquired customers with only 1 order",
+            "rules": [
+                {"field": "order_count", "operator": "==", "value": 1},
+                {"field": "last_order_date", "operator": "days_ago_lt", "value": 14}
+            ],
+            "suggested_action": "Welcome series with second-purchase discount"
+        },
+    ]
