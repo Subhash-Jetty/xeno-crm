@@ -4,6 +4,7 @@ Uses Groq (primary, blazing fast) with Gemini 2.5 Flash as fallback.
 """
 import json
 import logging
+import asyncio
 from uuid import UUID
 from datetime import datetime
 from groq import AsyncGroq
@@ -14,7 +15,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 # Initialize AI clients
-groq_client = AsyncGroq(api_key=settings.GROQ_API_KEY) if settings.GROQ_API_KEY else None
+groq_client = AsyncGroq(api_key=settings.GROQ_API_KEY, timeout=15.0) if settings.GROQ_API_KEY else None
 
 
 def init_gemini():
@@ -229,13 +230,16 @@ async def chat_with_ai(
     try:
         # Try Groq first (blazing fast)
         if groq_client:
-            response = await groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                tools=TOOL_DEFINITIONS,
-                tool_choice="auto",
-                temperature=0.7,
-                max_tokens=2048,
+            response = await asyncio.wait_for(
+                groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=messages,
+                    tools=TOOL_DEFINITIONS,
+                    tool_choice="auto",
+                    temperature=0.7,
+                    max_tokens=2048,
+                ),
+                timeout=15.0
             )
 
             assistant_message = response.choices[0].message
@@ -264,12 +268,15 @@ async def chat_with_ai(
                 role = "user" if msg["role"] == "user" else "model"
                 gemini_history.append({"role": role, "parts": [msg["content"]]})
 
-            response = await gemini_model.generate_content_async(
-                gemini_history,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.7,
-                    max_output_tokens=2048,
+            response = await asyncio.wait_for(
+                gemini_model.generate_content_async(
+                    gemini_history,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.7,
+                        max_output_tokens=2048,
+                    ),
                 ),
+                timeout=20.0
             )
             return response.text or "I'm not sure how to help with that.", tool_calls_made
 
@@ -300,11 +307,14 @@ Requirements:
 
     try:
         if groq_client:
-            response = await groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.8,
-                max_tokens=500,
+            response = await asyncio.wait_for(
+                groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.8,
+                    max_tokens=500,
+                ),
+                timeout=10.0
             )
             return response.choices[0].message.content.strip()
     except Exception as e:
@@ -312,7 +322,10 @@ Requirements:
 
     try:
         if gemini_model:
-            response = await gemini_model.generate_content_async(prompt)
+            response = await asyncio.wait_for(
+                gemini_model.generate_content_async(prompt),
+                timeout=15.0
+            )
             return response.text.strip()
     except Exception as e:
         logger.error(f"Both providers failed for message draft: {e}")
@@ -339,12 +352,15 @@ Only return valid JSON, no markdown or explanation."""
 
     try:
         if groq_client:
-            response = await groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=1000,
-                response_format={"type": "json_object"},
+            response = await asyncio.wait_for(
+                groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7,
+                    max_tokens=1000,
+                    response_format={"type": "json_object"},
+                ),
+                timeout=15.0
             )
             content = response.choices[0].message.content
             result = json.loads(content)

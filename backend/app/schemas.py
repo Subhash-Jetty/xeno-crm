@@ -4,7 +4,7 @@ Pydantic schemas for request/response validation.
 from datetime import datetime
 from typing import Optional
 from uuid import UUID
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
 # ──────────────────────────────────────────────
@@ -20,16 +20,26 @@ class CustomerCreate(BaseModel):
 
 class CustomerResponse(BaseModel):
     id: UUID
-    name: str
-    email: Optional[str]
-    phone: Optional[str]
-    total_spend: float
-    order_count: int
-    last_order_date: Optional[datetime]
-    first_order_date: Optional[datetime]
-    avg_order_value: float
-    tags: list[str]
-    created_at: datetime
+    name: Optional[str] = "Unknown"
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    total_spend: Optional[float] = 0.0
+    order_count: Optional[int] = 0
+    last_order_date: Optional[datetime] = None
+    first_order_date: Optional[datetime] = None
+    avg_order_value: Optional[float] = 0.0
+    tags: list[str] = Field(default_factory=list)
+    created_at: Optional[datetime] = None
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def handle_null_tags(cls, v):
+        return v if v is not None else []
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def handle_null_name(cls, v):
+        return v if v is not None else "Unknown"
 
     model_config = {"from_attributes": True}
 
@@ -62,12 +72,17 @@ class OrderCreate(BaseModel):
 class OrderResponse(BaseModel):
     id: UUID
     customer_id: UUID
-    order_number: Optional[str]
-    amount: float
-    items: list
-    channel: Optional[str]
-    status: str
-    created_at: datetime
+    order_number: Optional[str] = None
+    amount: Optional[float] = 0.0
+    items: list = Field(default_factory=list)
+    channel: Optional[str] = None
+    status: Optional[str] = "completed"
+    created_at: Optional[datetime] = None
+
+    @field_validator("items", mode="before")
+    @classmethod
+    def handle_null_items(cls, v):
+        return v if v is not None else []
 
     model_config = {"from_attributes": True}
 
@@ -98,12 +113,17 @@ class SegmentCreate(BaseModel):
 class SegmentResponse(BaseModel):
     id: UUID
     name: str
-    description: Optional[str]
-    rules: list
-    natural_language_query: Optional[str]
-    customer_count: int
-    is_ai_generated: bool
-    created_at: datetime
+    description: Optional[str] = None
+    rules: list = Field(default_factory=list)
+    natural_language_query: Optional[str] = None
+    customer_count: Optional[int] = 0
+    is_ai_generated: Optional[bool] = False
+    created_at: Optional[datetime] = None
+
+    @field_validator("rules", mode="before")
+    @classmethod
+    def handle_null_rules(cls, v):
+        return v if v is not None else []
 
     model_config = {"from_attributes": True}
 
