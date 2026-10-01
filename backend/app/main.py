@@ -6,7 +6,8 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.database import init_db, close_db
+from app.database import init_db, close_db, async_session
+from sqlalchemy import text
 from app.routers import customers, orders, segments, campaigns, receipts, ai
 
 
@@ -55,7 +56,14 @@ app.include_router(campaigns.router, prefix="/api/campaigns", tags=["Campaigns"]
 app.include_router(receipts.router, prefix="/api/receipts", tags=["Receipts"])
 app.include_router(ai.router, prefix="/api/ai", tags=["AI Agent"])
 
-
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "xeno-crm"}
+    """Health check that also pings the database to keep Supabase alive."""
+    db_ok = False
+    try:
+        async with async_session() as session:
+            await session.execute(text("SELECT 1"))
+            db_ok = True
+    except Exception:
+        pass
+    return {"status": "healthy", "service": "xeno-crm", "database": "connected" if db_ok else "unreachable"}
